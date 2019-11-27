@@ -1,0 +1,422 @@
+---
+title: "Weather and Air Quality App - NYCDSA Shiny Project"
+author: "Nick Tang"
+date: "November 27, 2019"
+output: html_document
+---
+
+## Link to app
+https://nwtang.shinyapps.io/weather/
+
+## Introduction
+
+Weather and air quality affect our daily lives. However, most of our understanding relies on basic observations that do not consider the physical and chemical mechanisms behind changes in weather and air quality. For example, we might say "it's really hot and smoggy today", and we know it's hot because it's summer, but have no idea why it's smoggy. I designed this app to be a compact, easy to use interface that allows the user to develop hypotheses and insights to help answer the following questions:
+
+1. How do weather and air quality vary from city to city across the United States?
+2. What factors influence the formation of ozone (smog)?
+3. When it is smoggy, which areas near the city should be warned (i.e., where does the smog go)?
+
+## Data Sources
+
+I used Selfish Gene's Historical Hourly Weather dataset in conjunction with EPA's Historical Air Quality dataset. Both datasets are from Kaggle. 
+
+Weather dataset: https://www.kaggle.com/selfishgene/historical-hourly-weather-data
+
+Air Quality dataset: https://www.kaggle.com/epa/epa-historical-air-quality
+
+The weather dataset included hourly measurements for temperature, wind direction, wind speed, and weather observations for selected US cities from 2013-2017. I downloaded the csvs separately from Kaggle and post-processed them into one dataframe using dplyr. 
+
+The air quality dataset was trickier and required use of the BigQuery API. I used the following code in python to query ozone and nitrogen dioxide (NO2) concentrations from the dataset:
+
+![](images/pythonapi.png)
+
+## Data Preparation
+
+Since the data used for this app is from two different sources, I needed to do some preprocessing to format it into a single backend dataframe. Thankfully, the data from both sources was relatively straightforward and easy to work with. Other than using the BigQuery API in python, I only had to do one other step outside of R, which was manually assigning more general weather observations (e.g. "Clear","Cloudy","Rainy") in place of more detailed ones (e.g. "partly sunny","75% overcast","thunderstorm"). I used this R script to preprocess the data from both sources into one dataframe:
+
+```{r preprocess, eval=FALSE, echo=TRUE}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# PROCESS TEMPERATURE DATA
+# Select just cities in USA, read in temperature.csv and filter only US cities
+city <- read.csv(file="./city_attributes.csv")
+city$City <- gsub(" ",".",city$City)
+city <- city[(city$Country=="United States"),]
+usa_cities <- unlist(lapply(city['City'],as.character))
+temp <- read.csv(file="./temperature.csv")
+temp_sub <- temp[,which(colnames(temp) %in% append(usa_cities,"datetime"))]
+temp_sub <- temp_sub %>% gather("City","Temp",usa_cities)
+# Convert temperature from K to F
+temp_sub$Temp <- round((temp_sub$Temp-273.15)*9/5+32,digits=0)
+temp_sub <- merge(temp_sub,city,by="City")
+
+# PROCESS WEATHER DESCRIPTION DATA
+# Read in description csv, filter only US cities, inner join with temp_sub
+desc <- read.csv(file="./weather_description.csv")
+desc_sub <- desc[,which(colnames(desc) %in% append(usa_cities,"datetime"))]
+desc_sub <- desc_sub %>% gather("City","Desc",usa_cities)
+temp_sub <- inner_join(temp_sub,desc_sub,by=c("datetime","City"))
+# Read in desc_summ (manually created to match detailed descriptions to general ones)
+# Join with temp_sub, get rid of old detailed description column and keep general one
+desc_summ <- read.csv(file="./desc_summ.csv")
+temp_sub <- inner_join(temp_sub,desc_summ,by="Desc")
+temp_sub <- select(temp_sub,-Desc)
+
+# PROCESS WIND DATA
+# Bring wind direction and speed into temp_sub
+wdir <- read.csv(file="./wind_direction.csv")
+wspd <- read.csv(file="./wind_speed.csv")
+wdir_sub <- wdir[,which(colnames(wdir) %in% append(usa_cities,"datetime"))]
+wdir_sub <- wdir_sub %>% gather("City","Wdir",usa_cities)
+wspd_sub <- wspd[,which(colnames(wspd) %in% append(usa_cities,"datetime"))]
+wspd_sub <- wspd_sub %>% gather("City","Wspd",usa_cities)
+temp_sub <- inner_join(temp_sub,wdir_sub,by=c("datetime","City"))
+temp_sub <- inner_join(temp_sub,wspd_sub,by=c("datetime","City"))
+
+# CLEAN LAT/LON COLUMNS
+# Convert timezone based on longitude (a rough approximation, appropriate for cities in this app)
+convert_time <- function(datetime,longitude) {
+  datetime_conv <- as.character(datetime)
+  datetime_conv <- as.POSIXct(datetime_conv,format="%Y-%m-%d %H:%M:%S")
+  if (longitude <= -115) {
+    datetime_conv <- datetime_conv-hours(8)
+  } else if ((longitude > -115) & (longitude <= -100)) {
+    datetime_conv <- datetime_conv-hours(7)
+  } else if ((longitude > -100) & (longitude <= -87)) {
+    datetime_conv <- datetime_conv-hours(6)
+  } else {
+    datetime_conv <- datetime_conv-hours(5)
+  }
+  return(datetime_conv)
+}
+
+# PROCESS O3 AND NO2 DATA 
+# Read in O3 and NO2, which were downloaded using python API
+o3 <- read.csv(file='o3_sub.csv')
+no2 <- read.csv(file='no2_sub.csv')
+# Concatenate O3 and NO2 into one dataframe, add columns for year/month/day/hour
+o3_no2 <- inner_join(o3,no2,by=c("Date","Time","City"))
+o3_no2 <- o3_no2 %>% mutate(Datetime = paste(Date,Time))
+o3_no2 <- o3_no2 %>% mutate(Year=lubridate::year(o3_no2$Datetime),
+                            Month=lubridate::month(o3_no2$Datetime,label=TRUE,abbr=FALSE),
+                            Day=lubridate::day(o3_no2$Datetime),
+                            HrofDay=lubridate::hour(o3_no2$Datetime)) %>% select(-Date,-Time,-Datetime)
+# Add columns for year/month/day/hour to temp_sub as well
+temp_sub$datetime <- convert_time(temp_sub$datetime,temp_sub$Longitude)
+temp_sub <- temp_sub %>% mutate(Year=lubridate::year(temp_sub$datetime),
+                                       Month=lubridate::month(temp_sub$datetime,label=TRUE,abbr=FALSE),
+                                       Day=lubridate::day(temp_sub$datetime),
+                                       HrofDay=lubridate::hour(temp_sub$datetime)) 
+temp_sub$City <- gsub("\\."," ",temp_sub$City)
+# Join temp_sub with O3/NO2 dataframe on time and city name
+temp_sub_pol <- inner_join(temp_sub,o3_no2,by=c("Year","Month","Day","HrofDay","City"))
+temp_sub_pol <- select(temp_sub_pol,-datetime,-Country,-Latitude,-Longitude)
+temp_sub_pol <- temp_sub_pol %>% filter(Year > 2012)
+# Save final table as csv for use in shiny app
+write.csv(temp_sub_pol,"temp_sub.csv")
+```
+
+## Basic Background
+
+Using temperature and weather observations to describe the weather is common knowledge (e.g. it's 60 degrees outside and raining), but describing and visualizing wind patterns and air quality metrics requires some basic background. 
+
+Wind patterns are visualized using a wind rose, which is essentially a bar chart plotted using a polar grid. The bars are referred to as "petals", which are binned using wind speeds. The angular coordinate represents the direction of the wind, where 0 degrees represents wind coming from the North. It is common to interpret this as 0 degrees representing wind blowing towards the North, which is incorrect. The radial coordinate represents how often wind is coming from each direction. An example wind rose is shown below:
+![](images/wr.png)
+
+Here, we would say that most of the time the wind is blowing West to East, and that the strongest winds also tend to blow in this direction. 
+
+The word "smog" is commonly used to describe bad air quality. Smog is actually ozone, which is also an EPA Criteria Air Pollutant and a greenhouse gas. Ozone formation is a complicated process that requires hundreds of chemical equations to describe properly, but I will whittle it down to the three most important factors:
+
+1. Sunlight
+2. Nitrogen dioxide (NO2), which is also an EPA Criteria Air Pollutant, and is primarily emitted from vehicles.
+3. Volatile organic compounds (VOCs) - most outdoor VOC emissions occur naturally from biogenic sources (e.g. trees). 
+
+Sunlight, NO2, and VOCs all need to be present for ozone to form. Below, I describe a few cases to illustrate ozone formation dynamics:
+
+1. It's a sunny day during rush hour, and vehicles are emitting lots of NO2. All NO2 emitted gets converted to ozone. 
+2. Same case as #1, but now we're in a very urbanized area with little biogenic VOC emissions. Since there is not enough VOC, only a small fraction of NO2 gets converted to ozone. This region can be described as "VOC-limited".
+3. Now imagine a sunny day in a rural area with few vehicles in sight. However, there is an oil products storage tank farm which is a large source of VOC. All NO2 gets converted to ozone, but only because there was very little to begin with. Ozone concentrations remain low. This region can be described as "NO2-limited". 
+4. It's a cloudy day or at night. No NO2 is converted to ozone. 
+
+Note that ozone and NO2 are relatively straightforward to measure, but VOCs are not. Ozone formation is commonly described and visualized as "percent conversion of NO2", and this app will do the same. 
+
+## Using the App
+
+Now we're ready to finally use the app. It consists of the following components:
+
+1. Sidebar toggles for averaging period (5-year, annual, monthly), hour of day, and the metric to be displayed on the map and histogram (temperature, ozone, or NO2). 
+2. Box displaying the statistics corresponding to the user's selection (selected city, climate description, number of total observations, percent completeness of data). 
+3. Leaflet map displaying all cities in the dataset and the average temperature/O3/NO2 over the selected averaging period and hour of day range. 
+4. Histogram of weather observations, binned by temperature/O3/NO2 and segregated by weather observations (clear, cloudy, fog, rain, snow), for all observations for the selected city over the selected averaging period and hour of day range. 
+5. O3 vs. NO2 hexbin plot, to help visualize ozone formation dynamics for the selected city over the selected averaging period and hour of day range. 
+6. Wind rose for the selected city over the selected averaging period and hour of day range. 
+
+It is up to the user to play around with the app to discover their own insights and hypotheses on weather and ozone formation across the United States. I include some example insights and hypotheses in the next section, and provide the shiny UI and server scripts at the end of this markdown document.
+
+## Example
+
+Let's look at Phoenix, which has one of the higher 5-year average ozone concentrations according to the leaflet map. It's constantly sunny, so this isn't too surprising.
+
+![](images/phx_5yr.png)
+
+The O3 vs. NO2 plot looks interesting. It seems like there are two modes that Phoenix experiences: one where nearly all NO2 is converted to ozone, and another where ozone conversion is very low (i.e., all NO2 remains in the atmosphere). After playing around with the sidebar toggles, I uncovered when these two modes occur. Pay attention to the hour of day slider in the two screenshots below:
+
+![](images/phx_day.png)
+
+![](images/phx_night.png)
+
+It is clear that ozone formation occurs during the day, where sunlight is present. So we can confirm what we read previously in the background section using the app. 
+
+What about seasonal variations? Let's try comparing winter (January) and summer (July):
+
+![](images/phx_jan.png)
+
+![](images/phx_jul.png)
+
+Looking into seasonal variations has uncovered another potential driver for these two modes of ozone conversion. Or could it just all be due to the presence of sunlight, since sunlight hours are longer in July than January? I would propose that there is another factor at play, since the January case includes daytime hours, and the near absence of ozone formation is surprising. Based on what we know about ozone, my hypothesis is that biogenic VOC emissions are small in the winter since the majority of plant life has died out for the season. The lack of biogenic VOC emissions limits the conversion of NO2 to ozone. When trees come back to life and are at their peak in July, biogenic VOC emissions are at their annual highs, which allows full conversion of NO2 to ozone. 
+
+Now that we know when maximum ozone concentration occurs (summer during daytime), we ask the last question: where does it go and who gets affected the most? The wind rose shows that ozone will most likely be pushed Northeast of Phoenix. On a very smoggy day, the local air quality district would issue a warning for residents living Northeast of Phoenix. 
+
+That's it for my example. Please feel free to play around with the app and develop your own insights and hypotheses! 
+
+## ui.R
+
+```{r ui, eval=FALSE, echo=TRUE}
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(maps)
+library(leaflet)
+library(lubridate)
+library(RColorBrewer)
+library(clifro)
+library(hexbin)
+
+city <- read.csv(file="./city_attributes.csv")
+city <- city[(city$Country=="United States"),]
+avg_period_choices <- c("5-year","Annual","Monthly")
+
+years <- c(2013:2017)
+months <- c("January","February","March","April","May","June",
+            "July","August","September","October","November","December")
+
+shinyUI(dashboardPage(
+  dashboardHeader(title = "Weather & AQ App"),
+  dashboardSidebar(
+    selectizeInput(inputId="avg_period",
+                   label="Averaging Period",
+                   choices=avg_period_choices),
+    conditionalPanel(
+      condition = "input.avg_period=='Annual'",
+      selectizeInput(inputId="year_period",
+                     label="Time Period Selection",
+                     choices=years)
+    ),
+    conditionalPanel(
+      condition = "input.avg_period=='Monthly'",
+      selectizeInput(inputId="month_period",
+                     label="Time Period",
+                     choices=months)
+    ),
+    sliderInput("hrofday",label=h5(strong("Hour of Day")),min=0,max=23,value=c(0,23)),
+    radioButtons("pol","Map and Histogram Display:",
+                 c("Temperature (deg F)" = "temp",
+                   "Ozone (ppb)" = "O3",
+                   "NO2 (ppb)" = "NO2"))
+  ),
+  dashboardBody(
+    tags$head(tags$style(HTML('.info-box {min-height: 76px;} .info-box-icon {height: 76px; line-height: 76px;} .info-box-content {padding-top: 0px; padding-bottom: 0px;}'))),
+    fluidRow(
+      box(title="Statistics",status="info",solidHeader=TRUE,
+          fluidRow(uiOutput("cityBox")),
+          fluidRow(uiOutput("climateBox")),
+          fluidRow(uiOutput("countBox")),
+          fluidRow(uiOutput("completeBox"))
+      ,width=4,height=420),
+      box(leafletOutput("map"),width=8)
+    ),
+    fluidRow(
+      box(title="Histogram of Weather Observations",status="primary",solidHeader=TRUE,plotOutput("dist"),width=4),
+      box(title="O3 vs. NO2 Hexbin Plot",status="primary",solidHeader=TRUE,plotOutput("hexbin"),width=4),
+      box(title="Wind Rose",status="primary",solidHeader=TRUE,plotOutput("wrose"),width=4)
+    )
+  )
+)
+)
+```
+
+
+## server.R
+
+```{r server, eval=FALSE, echo=TRUE}
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(maps)
+library(leaflet)
+library(lubridate)
+library(RColorBrewer)
+library(clifro)
+library(hexbin)
+
+# Select just cities in USA and Canada for plotting
+city <- read.csv(file="./city_attributes.csv")
+city <- city[(city$Country=="United States"),]
+usa_can_cities <- unlist(lapply(city['City'],as.character))
+
+# Read in preprocessed data (temperature, descriptions, wind direction and speed)
+temp_sub <- read.csv(file="./temp_sub.csv")
+pal_temp <- colorNumeric(palette = c("#6600ff","yellow","#cc0000"), domain = c(10,105))
+pal_O3 <- colorNumeric(palette = c("#6600ff","yellow","#cc0000"), domain = c(0,70))
+pal_NO2 <- colorNumeric(palette = c("#6600ff","yellow","#cc0000"), domain = c(0,35))
+
+# Server function begins here
+shinyServer(function(input, output, session) {
+  avg_per <- reactive({input$avg_period})
+  time_per <- reactive({if (avg_per()=="Annual") {
+    input$year_period 
+    } else if (avg_per()=="Monthly") {
+      input$month_period
+    } else {
+      "All"
+    }
+    })
+  start_hour <- reactive({input$hrofday[1]})
+  end_hour <- reactive({input$hrofday[2]})
+  select_city <- reactive({input$map_marker_click$id})
+  output$cityBox <- renderUI({
+    if (is.null(select_city())) {
+      infoBox("Selected City","None - select from map",icon=icon("city"),fill=TRUE,width=12)
+    } else {
+      infoBox("Selected City",select_city(),icon=icon("city"),fill=TRUE,width=12)
+    }
+  })
+  output$climateBox <- renderUI({
+    if (is.null(select_city())) {
+      infoBox("Climate Description","None - select from map",icon=icon("sun"),fill=TRUE,width=12)
+    } else {
+      infoBox("Climate Description",select(filter(city,City==select_city()),Climate),icon=icon("sun"),fill=TRUE,width=12)
+    }
+  })
+  temp_avg <- reactive({
+    if (avg_per()=="Annual") {
+      temp_sub %>% filter(Year==time_per() & HrofDay >= start_hour() & HrofDay <= end_hour()) %>% group_by(City) %>%
+        summarize(Temp_avg=mean(Temp,na.rm=TRUE),O3_avg=mean(O3,na.rm=TRUE),NO2_avg=mean(NO2,na.rm=TRUE)) %>% 
+        merge(city,by="City")
+    } else if (avg_per()=="Monthly") {
+      temp_sub %>% filter(grepl(as.character(time_per()),Month) & HrofDay >= start_hour() & HrofDay <= end_hour()) %>%
+        group_by(City) %>% summarize(Temp_avg=mean(Temp,na.rm=TRUE),O3_avg=mean(O3,na.rm=TRUE),
+                                     NO2_avg=mean(NO2,na.rm=TRUE)) %>% merge(city,by="City")
+    } else {
+      temp_sub %>% filter(HrofDay >= start_hour() & HrofDay <= end_hour()) %>% group_by(City) %>% 
+        summarize(Temp_avg=mean(Temp,na.rm=TRUE),O3_avg=mean(O3,na.rm=TRUE),NO2_avg=mean(NO2,na.rm=TRUE)) %>% 
+        merge(city,by="City")
+    }
+  })
+  temp_city <- reactive({
+    if (avg_per()=="Annual") {
+      temp_sub %>% 
+        filter(Year==time_per() & HrofDay >= start_hour() & HrofDay <= end_hour() & 
+                 grepl(as.character(select_city()),City))
+    } else if (avg_per()=="Monthly") {
+      temp_sub %>% filter(grepl(as.character(time_per()),Month) & HrofDay >= start_hour() & HrofDay <= end_hour() &
+                            grepl(as.character(select_city()),City))
+    } else {
+      temp_sub %>% filter(HrofDay >= start_hour() & HrofDay <= end_hour() & 
+                            grepl(as.character(select_city()),City))
+    }
+  })
+  output$countBox <- renderUI({
+    if (is.null(select_city())) {
+      infoBox("Number of Observations",0,icon=icon("th-list"),fill=TRUE,width=12)
+    } else {
+      infoBox("Number of Observations",nrow(temp_city()),icon=icon("th-list"),fill=TRUE,width=12)
+    }
+  })
+  output$completeBox <- renderUI({
+    if (is.null(select_city())) {
+      infoBox("Percent Completeness","N/A",icon=icon("percent"),fill=TRUE,width=12)
+    } else {
+      if (avg_per()=="Annual") {
+        infoBox("Percent Completeness",round(100*nrow(temp_city())/(365*(end_hour()-start_hour()+1)),1),
+                icon=icon("percent"),fill=TRUE,width=12)
+      } else if (avg_per()=="Monthly") {
+          if (time_per()=="February") {
+            infoBox("Percent Completeness",round(100*nrow(temp_city())/(28*(end_hour()-start_hour()+1)*5),1),
+                    icon=icon("percent"),fill=TRUE,width=12)
+          } else if (time_per() %in% c("April","June","September","November")) {
+            infoBox("Percent Completeness",round(100*nrow(temp_city())/(30*(end_hour()-start_hour()+1)*5),1),
+                    icon=icon("percent"),fill=TRUE,width=12)
+          } else {
+            infoBox("Percent Completeness",round(100*nrow(temp_city())/(31*(end_hour()-start_hour()+1)*5),1),
+                    icon=icon("percent"),fill=TRUE,width=12)
+          }
+      } else {
+        infoBox("Percent Completeness",round(100*nrow(temp_city())/(365*(end_hour()-start_hour()+1)*5),1),
+                icon=icon("percent"),fill=TRUE,width=12)
+      }
+    }    
+  })
+  output$map <- renderLeaflet({
+    switch(input$pol,
+           temp = leaflet(data=temp_avg()) %>% addTiles() %>%
+             addCircleMarkers(~Longitude,~Latitude,color=~pal_temp(Temp_avg),label=~round(Temp_avg,digits=0),
+                              labelOptions = labelOptions(noHide = TRUE,textOnly=TRUE,direction="center"),
+                              popup=~City,layerId=~City),
+           O3 = leaflet(data=temp_avg()) %>% addTiles() %>%
+             addCircleMarkers(~Longitude,~Latitude,color=~pal_O3(O3_avg),label=~round(O3_avg,digits=0),
+                              labelOptions = labelOptions(noHide = TRUE,textOnly=TRUE,direction="center"),
+                              popup=~City,layerId=~City),
+           NO2 = leaflet(data=temp_avg()) %>% addTiles() %>%
+             addCircleMarkers(~Longitude,~Latitude,color=~pal_NO2(NO2_avg),label=~round(NO2_avg,digits=0),
+                              labelOptions = labelOptions(noHide = TRUE,textOnly=TRUE,direction="center"),
+                              popup=~City,layerId=~City))
+    
+  })
+  observeEvent(input$map_marker_click, {
+               selected_city<-input$map_marker_click$id
+               })
+  observeEvent(input$map_marker_click, {
+    output$dist <- renderPlot({
+      switch(input$pol,
+             temp = subset(temp_city(),!is.na(Temp)) %>% 
+               ggplot(aes(x=Temp,fill=factor(Group,levels=c("Snow","Rain","Fog","Cloudy","Clear")))) + 
+               geom_histogram(binwidth=5,color="#333333",alpha=0.5) +
+               guides(fill=guide_legend(title="Description")) + 
+               scale_fill_manual(values=c("Snow"="#6600ff","Rain"="#0066ff","Fog"="#00ff99","Cloudy"="#ffff00",
+                                          "Clear"="#ff6600")) + xlab("Temperature (deg F)"),
+             O3 = subset(temp_city(),!is.na(O3)) %>% 
+               ggplot(aes(x=O3,fill=factor(Group,levels=c("Snow","Rain","Fog","Cloudy","Clear")))) + 
+               geom_histogram(binwidth=5,color="#333333",alpha=0.5) +
+               guides(fill=guide_legend(title="Description")) + 
+               scale_fill_manual(values=c("Snow"="#6600ff","Rain"="#0066ff","Fog"="#00ff99","Cloudy"="#ffff00",
+                                          "Clear"="#ff6600")) + xlab("Ozone (ppb)"),
+             NO2 = subset(temp_city(),!is.na(NO2)) %>% 
+               ggplot(aes(x=NO2,fill=factor(Group,levels=c("Snow","Rain","Fog","Cloudy","Clear")))) + 
+               geom_histogram(binwidth=5,color="#333333",alpha=0.5) +
+               guides(fill=guide_legend(title="Description")) + 
+               scale_fill_manual(values=c("Snow"="#6600ff","Rain"="#0066ff","Fog"="#00ff99","Cloudy"="#ffff00",
+                                          "Clear"="#ff6600")) + xlab("NO2 (ppb)"))
+    })
+  })
+  observeEvent(input$map_marker_click, {
+    output$hexbin <- renderPlot({
+      ggplot(data=temp_city(),aes(x=NO2,y=O3)) + stat_binhex(aes(color=..count..)) +
+        theme(legend.position='none') + scale_fill_continuous(type="viridis")
+    })
+  })
+  temp_city_wind <- reactive({drop_na(temp_city())})
+  observeEvent(input$map_marker_click, {
+    output$wrose <- renderPlot({
+    windrose(temp_city_wind()$Wspd,temp_city_wind()$Wdir,n_directions=12,
+             speed_cuts=c(1,3,5,8,12,20,50),col_pal="YlOrRd")
+    })
+  })
+})
+```
